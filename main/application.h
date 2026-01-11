@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -31,6 +32,7 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_TTS_DRAIN_CHECK      (1 << 13)
 
 
 enum AecMode {
@@ -129,6 +131,7 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    esp_timer_handle_t tts_drain_timer_handle_ = nullptr;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -143,6 +146,12 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // TTS drain handling (prevents tail cut-off): after receiving `tts:stop`, stay in Speaking
+    // until the audio decode/playback queues are drained, then transition to Listening/Idle.
+    bool tts_stop_pending_ = false;
+    std::atomic<int64_t> tts_stop_received_us_{0};
+    std::atomic<int64_t> last_incoming_audio_us_{0};
+
 
     // Event handlers
     void HandleStateChangedEvent();
@@ -153,6 +162,7 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    void HandleTtsDrainCheckEvent();
 
     // Activation task (runs in background)
     void ActivationTask();

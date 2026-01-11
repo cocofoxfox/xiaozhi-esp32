@@ -44,12 +44,28 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    esp_timer_create_args_t tts_drain_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            xEventGroupSetBits(app->event_group_, MAIN_EVENT_TTS_DRAIN_CHECK);
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "tts_drain_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&tts_drain_timer_args, &tts_drain_timer_handle_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (tts_drain_timer_handle_ != nullptr) {
+        esp_timer_stop(tts_drain_timer_handle_);
+        esp_timer_delete(tts_drain_timer_handle_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -170,6 +186,7 @@ void Application::Run() {
         MAIN_EVENT_WAKE_WORD_DETECTED |
         MAIN_EVENT_VAD_CHANGE |
         MAIN_EVENT_CLOCK_TICK |
+        MAIN_EVENT_TTS_DRAIN_CHECK |
         MAIN_EVENT_ERROR |
         MAIN_EVENT_NETWORK_CONNECTED |
         MAIN_EVENT_NETWORK_DISCONNECTED |
@@ -241,6 +258,10 @@ void Application::Run() {
             for (auto& task : tasks) {
                 task();
             }
+        }
+
+        if (bits & MAIN_EVENT_TTS_DRAIN_CHECK) {
+            HandleTtsDrainCheckEvent();
         }
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
@@ -493,6 +514,7 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
+            last_incoming_audio_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -522,16 +544,27 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    tts_stop_pending_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
-                        } else {
-                            SetDeviceState(kDeviceStateListening);
+                        if (aborted_) {
+                            if (listening_mode_ == kListeningModeManualStop) {
+                                SetDeviceState(kDeviceStateIdle);
+                            } else {
+                                SetDeviceState(kDeviceStateListening);
+                            }
+                            return;
                         }
+
+                        tts_stop_pending_ = true;
+                        tts_stop_received_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+
+                        // Poll frequently while draining to avoid tail cut-off.
+                        // If already started, esp_timer_start_periodic will return an error; ignore it.
+                        (void)esp_timer_start_periodic(tts_drain_timer_handle_, 50 * 1000); // 50ms
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -665,6 +698,47 @@ void Application::StartListening() {
 
 void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
+}
+
+void Application::HandleTtsDrainCheckEvent() {
+    if (!tts_stop_pending_) {
+        (void)esp_timer_stop(tts_drain_timer_handle_);
+        return;
+    }
+    if (GetDeviceState() != kDeviceStateSpeaking) {
+        tts_stop_pending_ = false;
+        (void)esp_timer_stop(tts_drain_timer_handle_);
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t stop_us = tts_stop_received_us_.load(std::memory_order_relaxed);
+    const int64_t last_audio_us = last_incoming_audio_us_.load(std::memory_order_relaxed);
+
+    // Allow a small grace window for any late-delivered audio callbacks after `tts:stop`.
+    const bool no_recent_audio = (last_audio_us > 0) ? (now_us-last_audio_us > 200*1000) : (now_us-stop_us > 200*1000);
+    const bool grace_since_stop = (stop_us > 0) ? (now_us-stop_us > 200*1000) : true;
+    const bool drained = audio_service_.IsPlaybackIdle();
+
+    // Safety: don't get stuck in Speaking forever if something goes wrong.
+    const bool timeout = (stop_us > 0) ? (now_us-stop_us > 5*1000*1000) : false;
+
+    if (!(timeout || (drained && no_recent_audio && grace_since_stop))) {
+        return;
+    }
+
+    if (timeout && !drained) {
+        ESP_LOGW(TAG, "TTS drain timeout; forcing state transition (may cut tail)");
+    }
+
+    tts_stop_pending_ = false;
+    (void)esp_timer_stop(tts_drain_timer_handle_);
+
+    if (listening_mode_ == kListeningModeManualStop) {
+        SetDeviceState(kDeviceStateIdle);
+    } else {
+        SetDeviceState(kDeviceStateListening);
+    }
 }
 
 void Application::HandleToggleChatEvent() {
@@ -805,6 +879,8 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+            tts_stop_pending_ = false;
+            (void)esp_timer_stop(tts_drain_timer_handle_);
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
             audio_service_.EnableVoiceProcessing(false);
@@ -816,6 +892,8 @@ void Application::HandleStateChangedEvent() {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+            tts_stop_pending_ = false;
+            (void)esp_timer_stop(tts_drain_timer_handle_);
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
@@ -1052,4 +1130,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-
