@@ -1,0 +1,2 @@
+CONFIG_OTA_URL="https://aidoll-gateway-dev.fly.dev/api/ota/"
+CONFIG_BOARD_TYPE_ESP_BOX_3=y
